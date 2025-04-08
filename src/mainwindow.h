@@ -22,12 +22,17 @@
 #include <QtMath>
 #include "joystickmanager.h"
 #include "faststeeringmirror.h"
+// Add tracker-related includes
+#include "trackermemory.h"
+#include "trackdata.h"
+#include "logger.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
 
 class QGroupBox;
+class QTabWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -70,6 +75,16 @@ private slots:
     void onXAxisToggled(bool checked);
     void onYAxisToggled(bool checked);
     void onPhaseOffsetChanged(int value);
+
+    // Tracker related slots
+    void onTrackerInitButtonClicked();
+    void onTrackerPingButtonClicked();
+    void onTrackerStartLoggingButtonClicked();
+    void onTrackerStopLoggingButtonClicked();
+    void onTrackerAutoPollToggled(bool checked);
+    void pollTracker();
+    void handleTrackerError(const QString& errorMsg);
+    void handleLoggerError(const QString& errorMsg);
 
 private:
     Ui::MainWindow *ui;
@@ -141,11 +156,35 @@ private:
     double m_deadzone;
     QTimer *m_updateTimer;
 
+    // Tracker-related members
+    TrackerMemory *m_trackerMemory;
+    Logger *m_trackerLogger;
+    QTimer *m_trackerPollTimer;
+
+    // Tracker UI elements
+    QLineEdit *m_rawErrorXLineEdit;
+    QLineEdit *m_rawErrorYLineEdit;
+    QLineEdit *m_filteredErrorXLineEdit;
+    QLineEdit *m_filteredErrorYLineEdit;
+    QLineEdit *m_trackStateLineEdit;
+    QLineEdit *m_trackModeLineEdit;
+    QLineEdit *m_targetPolarityLineEdit;
+    QLineEdit *m_statusLineEdit;
+    QLabel *m_trackerStatusLabel;
+    QPushButton *m_trackerInitButton;
+    QPushButton *m_trackerPingButton;
+    QPushButton *m_trackerStartLoggingButton;
+    QPushButton *m_trackerStopLoggingButton;
+    QCheckBox *m_trackerAutoPollCheckBox;
+
     void createJoystickInputsUI();
     void clearJoystickInputsUI();
     void createMirrorControlUI();
     void createSineWaveTab();
+    void createTrackerTab();  // New method for creating tracker tab
     void updateWaveformDisplay();
+    void updateTrackerUI(const TrackData& data);
+    void setTrackerUIEnabled(bool enabled);
     QString hatValueToString(int value);
 
     // Helper method to map joystick axis value to mirror position

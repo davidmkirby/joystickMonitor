@@ -40,11 +40,15 @@ MainWindow::MainWindow(QWidget *parent)
     , m_loggingActive(false)
     , m_logFile(nullptr)
     , m_logStream(nullptr)
+    // Initialize tracker-related members
+    , m_trackerMemory(new TrackerMemory(this))
+    , m_trackerLogger(new Logger(this))
+    , m_trackerPollTimer(new QTimer(this))
 {
     ui->setupUi(this);
 
     // Set window title
-    setWindowTitle("Joystick Mirror Controller");
+    setWindowTitle("Joystick & Tracker Monitor");
 
     // Create a tab widget if not already in the UI
     QTabWidget *tabWidget = new QTabWidget(this);
@@ -174,16 +178,19 @@ MainWindow::MainWindow(QWidget *parent)
     tabWidget->addTab(joystickTab, "Joystick Input");
     tabWidget->addTab(mirrorTab, "Mirror Control");
 
+    // Create tracker tab
+    createTrackerTab();
+
+    // Initialize joystick manager
+    m_joystickManager->initialize();
+
     // Initialize mirror controller
     if (!m_mirrorController->initialize()) {
         QMessageBox::warning(this, "Mirror Initialization Error",
             "Failed to initialize mirror controller: " + m_mirrorController->getLastError());
     }
 
-    // Initialize joystick manager
-    m_joystickManager->initialize();
-
-    // Connect signals and slots
+    // Connect joystick signals and slots
     connect(refreshButton, &QPushButton::clicked, this, &MainWindow::onRefreshJoysticks);
     connect(joystickComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onJoystickSelected);
@@ -245,6 +252,12 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_updateTimer, &QTimer::timeout, this, &MainWindow::onUpdateMirrorPosition);
     m_updateTimer->setInterval(16);  // ~60Hz updates
 
+    // Connect tracker signals and configure poll timer
+    connect(m_trackerMemory, &TrackerMemory::errorOccurred, this, &MainWindow::handleTrackerError);
+    connect(m_trackerLogger, &Logger::errorOccurred, this, &MainWindow::handleLoggerError);
+    connect(m_trackerPollTimer, &QTimer::timeout, this, &MainWindow::pollTracker);
+    m_trackerPollTimer->setInterval(4);  // 4ms = 250Hz
+
     // Create mirror status UI
     createMirrorControlUI();
 
@@ -258,13 +271,15 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    // Stop all timers
     m_updateTimer->stop();
+    m_trackerPollTimer->stop();
 
     if (m_sineWaveTimer) {
         m_sineWaveTimer->stop();
     }
 
-    // Close logging if active
+    // Close joystick logging if active
     if (m_loggingActive) {
         if (m_logStream) {
             m_logStream->flush();
@@ -279,8 +294,14 @@ MainWindow::~MainWindow()
         }
     }
 
+    // Close tracker logging
+    m_trackerLogger->stopLogging();
+
+    // Clean up resources
     m_joystickManager->cleanup();
     m_mirrorController->cleanup();
+    m_trackerMemory->cleanup();
+
     delete ui;
 }
 
@@ -1047,14 +1068,17 @@ void MainWindow::onUpdateSineWave()
         // Get current mirror position feedback
         QPair<double, double> currentVoltages = m_mirrorController->getCurrentVoltages();
 
-        // Format: Timestamp, Frequency, Amplitude, X-Commanded, Y-Commanded, X-Feedback, Y-Feedback
-        *m_logStream << elapsedSec << ","
-                    << m_sineFrequency << ","
-                    << m_sineAmplitude << ","
-                    << xValue << ","
-                    << yValue << ","
-                    << currentVoltages.first << ","
-                    << currentVoltages.second << "\n";
+        // Get high-precision timestamp
+        QString timestamp = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz");
+
+        // Format values with 5 decimal places
+        *m_logStream << timestamp << ","
+                    << QString::number(m_sineFrequency, 'f', 5) << ","
+                    << QString::number(m_sineAmplitude, 'f', 5) << ","
+                    << QString::number(xValue, 'f', 5) << ","
+                    << QString::number(yValue, 'f', 5) << ","
+                    << QString::number(currentVoltages.first, 'f', 5) << ","
+                    << QString::number(currentVoltages.second, 'f', 5) << "\n";
 
         // Ensure data is written to disk
         m_logStream->flush();
@@ -1126,7 +1150,7 @@ void MainWindow::onBrowseLogFile()
     QString filePath = QFileDialog::getSaveFileName(this,
                                                    "Select Log File",
                                                    "",
-                                                   "CSV Files (*.csv)");
+                                                   "CSV Files (*.csv);;All Files (*)");
 
     if (!filePath.isEmpty()) {
         m_logFileEdit->setText(filePath);
@@ -1161,8 +1185,12 @@ void MainWindow::onStartStopLogging()
         // Create the text stream
         m_logStream = new QTextStream(m_logFile);
 
+        // Set high precision for floating point values
+        m_logStream->setRealNumberPrecision(5); // 5 decimal places
+        m_logStream->setRealNumberNotation(QTextStream::FixedNotation);
+
         // Write header
-        *m_logStream << "Time(s),Frequency(Hz),Amplitude,X-Command,Y-Command,X-Feedback(V),Y-Feedback(V)\n";
+        *m_logStream << "Timestamp,Frequency(Hz),Amplitude,X-Command,Y-Command,X-Feedback(V),Y-Feedback(V)" << Qt::endl;
 
         // Update UI
         m_loggingButton->setText("Stop Logging");
@@ -1227,4 +1255,211 @@ void MainWindow::onPhaseOffsetChanged(int value)
 {
     m_phaseOffset = value;
     qDebug() << "Phase offset changed to" << value << "degrees";
+}
+
+// Tracker-related methods
+void MainWindow::createTrackerTab()
+{
+    // Create the tracker tab
+    QWidget *trackerTab = new QWidget();
+    QVBoxLayout *trackerLayout = new QVBoxLayout(trackerTab);
+
+    // Create track errors group
+    QGroupBox *trackErrorsGroup = new QGroupBox("Track Errors");
+    QGridLayout *trackErrorsLayout = new QGridLayout(trackErrorsGroup);
+
+    // Raw errors
+    trackErrorsLayout->addWidget(new QLabel("Raw Error X:"), 0, 0);
+    m_rawErrorXLineEdit = new QLineEdit();
+    m_rawErrorXLineEdit->setReadOnly(true);
+    trackErrorsLayout->addWidget(m_rawErrorXLineEdit, 0, 1);
+
+    trackErrorsLayout->addWidget(new QLabel("Raw Error Y:"), 0, 2);
+    m_rawErrorYLineEdit = new QLineEdit();
+    m_rawErrorYLineEdit->setReadOnly(true);
+    trackErrorsLayout->addWidget(m_rawErrorYLineEdit, 0, 3);
+
+    // Filtered errors
+    trackErrorsLayout->addWidget(new QLabel("Filtered Error X:"), 1, 0);
+    m_filteredErrorXLineEdit = new QLineEdit();
+    m_filteredErrorXLineEdit->setReadOnly(true);
+    trackErrorsLayout->addWidget(m_filteredErrorXLineEdit, 1, 1);
+
+    trackErrorsLayout->addWidget(new QLabel("Filtered Error Y:"), 1, 2);
+    m_filteredErrorYLineEdit = new QLineEdit();
+    m_filteredErrorYLineEdit->setReadOnly(true);
+    trackErrorsLayout->addWidget(m_filteredErrorYLineEdit, 1, 3);
+
+    trackerLayout->addWidget(trackErrorsGroup);
+
+    // Create status information group
+    QGroupBox *statusGroup = new QGroupBox("Status Information");
+    QGridLayout *statusLayout = new QGridLayout(statusGroup);
+
+    statusLayout->addWidget(new QLabel("Track State:"), 0, 0);
+    m_trackStateLineEdit = new QLineEdit();
+    m_trackStateLineEdit->setReadOnly(true);
+    statusLayout->addWidget(m_trackStateLineEdit, 0, 1);
+
+    statusLayout->addWidget(new QLabel("Track Mode:"), 0, 2);
+    m_trackModeLineEdit = new QLineEdit();
+    m_trackModeLineEdit->setReadOnly(true);
+    statusLayout->addWidget(m_trackModeLineEdit, 0, 3);
+
+    statusLayout->addWidget(new QLabel("Target Polarity:"), 1, 0);
+    m_targetPolarityLineEdit = new QLineEdit();
+    m_targetPolarityLineEdit->setReadOnly(true);
+    statusLayout->addWidget(m_targetPolarityLineEdit, 1, 1);
+
+    statusLayout->addWidget(new QLabel("Status:"), 1, 2);
+    m_statusLineEdit = new QLineEdit();
+    m_statusLineEdit->setReadOnly(true);
+    statusLayout->addWidget(m_statusLineEdit, 1, 3);
+
+    trackerLayout->addWidget(statusGroup);
+
+    // Create control buttons layout
+    QHBoxLayout *controlLayout = new QHBoxLayout();
+
+    m_trackerInitButton = new QPushButton("Initialize");
+    controlLayout->addWidget(m_trackerInitButton);
+
+    m_trackerPingButton = new QPushButton("Ping");
+    controlLayout->addWidget(m_trackerPingButton);
+
+    m_trackerStartLoggingButton = new QPushButton("Start Logging");
+    controlLayout->addWidget(m_trackerStartLoggingButton);
+
+    m_trackerStopLoggingButton = new QPushButton("Stop Logging");
+    controlLayout->addWidget(m_trackerStopLoggingButton);
+
+    m_trackerAutoPollCheckBox = new QCheckBox("Automatic Poll");
+    controlLayout->addWidget(m_trackerAutoPollCheckBox);
+
+    trackerLayout->addLayout(controlLayout);
+
+    // Create status label
+    m_trackerStatusLabel = new QLabel("Not Initialized");
+    trackerLayout->addWidget(m_trackerStatusLabel);
+
+    // Add a stretch to keep UI elements at the top
+    trackerLayout->addStretch();
+
+    // Add the tab to the tab widget
+    QTabWidget *tabWidget = qobject_cast<QTabWidget*>(centralWidget());
+    if (tabWidget) {
+        tabWidget->addTab(trackerTab, "Tracker Monitor");
+    }
+
+    // Connect signals and slots
+    connect(m_trackerInitButton, &QPushButton::clicked, this, &MainWindow::onTrackerInitButtonClicked);
+    connect(m_trackerPingButton, &QPushButton::clicked, this, &MainWindow::onTrackerPingButtonClicked);
+    connect(m_trackerStartLoggingButton, &QPushButton::clicked, this, &MainWindow::onTrackerStartLoggingButtonClicked);
+    connect(m_trackerStopLoggingButton, &QPushButton::clicked, this, &MainWindow::onTrackerStopLoggingButtonClicked);
+    connect(m_trackerAutoPollCheckBox, &QCheckBox::toggled, this, &MainWindow::onTrackerAutoPollToggled);
+
+    // Initialize UI state
+    setTrackerUIEnabled(false);
+    m_trackerStopLoggingButton->setEnabled(false);
+}
+
+void MainWindow::onTrackerInitButtonClicked()
+{
+    // Initialize the tracker memory with PCI device location and base address
+    if (m_trackerMemory->initialize(0xdba00000, 0x0800, 0x98, 0x00, 0x00)) {
+        m_trackerStatusLabel->setText("Initialized");
+        setTrackerUIEnabled(true);
+    } else {
+        m_trackerStatusLabel->setText("Initialization failed");
+    }
+}
+
+void MainWindow::onTrackerPingButtonClicked()
+{
+    if (m_trackerMemory->sendPing()) {
+        m_trackerStatusLabel->setText("Ping sent");
+    } else {
+        m_trackerStatusLabel->setText("Ping failed");
+    }
+}
+
+void MainWindow::onTrackerStartLoggingButtonClicked()
+{
+    QString filename = QFileDialog::getSaveFileName(this, "Save Track Log File", "", "CSV Files (*.csv);;All Files (*)");
+    if (filename.isEmpty()) {
+        return;
+    }
+
+    if (m_trackerLogger->startLogging(filename)) {
+        m_trackerStatusLabel->setText("Logging started: " + filename);
+        m_trackerStartLoggingButton->setEnabled(false);
+        m_trackerStopLoggingButton->setEnabled(true);
+    }
+}
+
+void MainWindow::onTrackerStopLoggingButtonClicked()
+{
+    m_trackerLogger->stopLogging();
+    m_trackerStatusLabel->setText("Logging stopped");
+    m_trackerStartLoggingButton->setEnabled(true);
+    m_trackerStopLoggingButton->setEnabled(false);
+}
+
+void MainWindow::onTrackerAutoPollToggled(bool checked)
+{
+    // Start or stop polling
+    if (checked) {
+        m_trackerPollTimer->start();
+        m_trackerStatusLabel->setText("Automatic polling started");
+    } else {
+        m_trackerPollTimer->stop();
+        m_trackerStatusLabel->setText("Automatic polling stopped");
+    }
+}
+
+void MainWindow::pollTracker()
+{
+    TrackData data;
+    if (m_trackerMemory->readStatusData(data)) {
+        updateTrackerUI(data);
+
+        // Log the data if logging is enabled
+        if (m_trackerLogger->isLogging()) {
+            m_trackerLogger->logData(data);
+        }
+    }
+}
+
+void MainWindow::updateTrackerUI(const TrackData& data)
+{
+    // Update track errors with 5 decimal places (full card precision)
+    m_rawErrorXLineEdit->setText(QString::number(data.rawErrorX, 'f', 5));
+    m_rawErrorYLineEdit->setText(QString::number(data.rawErrorY, 'f', 5));
+    m_filteredErrorXLineEdit->setText(QString::number(data.filteredErrorX, 'f', 5));
+    m_filteredErrorYLineEdit->setText(QString::number(data.filteredErrorY, 'f', 5));
+
+    // Update status information
+    m_trackStateLineEdit->setText(data.getStateString());
+    m_trackModeLineEdit->setText(data.getModeString());
+    m_targetPolarityLineEdit->setText(data.getPolarityString());
+    m_statusLineEdit->setText(data.getStatusString());
+}
+
+void MainWindow::setTrackerUIEnabled(bool enabled)
+{
+    m_trackerPingButton->setEnabled(enabled);
+    m_trackerStartLoggingButton->setEnabled(enabled);
+    m_trackerAutoPollCheckBox->setEnabled(enabled);
+}
+
+void MainWindow::handleTrackerError(const QString& errorMsg)
+{
+    m_trackerStatusLabel->setText("Tracker error: " + errorMsg);
+    QMessageBox::critical(this, "Tracker Error", errorMsg);
+}
+
+void MainWindow::handleLoggerError(const QString& errorMsg)
+{
+    m_trackerStatusLabel->setText("Logger error: " + errorMsg);
+    QMessageBox::critical(this, "Logger Error", errorMsg);
 }
