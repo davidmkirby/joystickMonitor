@@ -2,5 +2,7 @@
 <RCC version="1.0">
     <qresource prefix="/">
         <!-- Add resources here if needed -->
+        <file>sinewave.svg</file>
+        <file>sinewaveOff.svg</file>
     </qresource>
 </RCC>

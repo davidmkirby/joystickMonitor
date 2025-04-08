@@ -13,6 +13,13 @@
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QLineEdit>
+#include <QFile>
+#include <QTextStream>
+#include <QDateTime>
+#include <QFileDialog>
+#include <QMessageBox>
+#include <QPainter>
+#include <QtMath>
 #include "joystickmanager.h"
 #include "faststeeringmirror.h"
 
@@ -53,6 +60,17 @@ private slots:
     void onInvertAxisToggled(bool checked);
     void onEnableMirrorOutput(bool enabled);
 
+    // Sine wave testing slots
+    void onStartStopSineWave();
+    void onUpdateSineWave();
+    void onBrowseLogFile();
+    void onStartStopLogging();
+    void onFrequencyChanged(int value);
+    void onAmplitudeChanged(double value);
+    void onXAxisToggled(bool checked);
+    void onYAxisToggled(bool checked);
+    void onPhaseOffsetChanged(int value);
+
 private:
     Ui::MainWindow *ui;
     JoystickManager *m_joystickManager;
@@ -82,6 +100,37 @@ private:
     QProgressBar *m_mirrorXBar;
     QProgressBar *m_mirrorYBar;
 
+    // Sine wave test UI elements
+    QSpinBox *m_frequencySpinBox;
+    QDoubleSpinBox *m_amplitudeSpinBox;
+    QSpinBox *m_phaseOffsetSpinBox;
+    QPushButton *m_sineWaveButton;
+    QCheckBox *m_xAxisCheckBox;
+    QCheckBox *m_yAxisCheckBox;
+    QPushButton *m_loggingButton;
+    QLineEdit *m_logFileEdit;
+    QPushButton *m_browseButton;
+    QLabel *m_waveformLabel;
+    QProgressBar *m_xOutputBar;
+    QProgressBar *m_yOutputBar;
+
+    // Sine wave generation
+    QTimer *m_sineWaveTimer;
+    bool m_sineWaveActive;
+    double m_sinePhase;
+    double m_sineFrequency;
+    double m_sineAmplitude;
+    int m_phaseOffset;    // Phase offset between X and Y (in degrees)
+    QVector<double> m_xWaveformData;
+    QVector<double> m_yWaveformData;
+    QVector<QPointF> m_waveformPoints;
+    QDateTime m_startTime;
+
+    // Data logging
+    QFile *m_logFile;
+    QTextStream *m_logStream;
+    bool m_loggingActive;
+
     // State variables
     int m_selectedJoystickIndex;
     bool m_mirrorOutputEnabled;
@@ -95,6 +144,8 @@ private:
     void createJoystickInputsUI();
     void clearJoystickInputsUI();
     void createMirrorControlUI();
+    void createSineWaveTab();
+    void updateWaveformDisplay();
     QString hatValueToString(int value);
 
     // Helper method to map joystick axis value to mirror position

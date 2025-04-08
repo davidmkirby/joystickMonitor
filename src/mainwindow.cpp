@@ -15,6 +15,9 @@
 #include <QTabWidget>
 #include <QFileDialog>
 #include <QLineEdit>
+#include <QDoubleSpinBox>
+#include <QPainter>
+#include <QDateTime>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -29,6 +32,14 @@ MainWindow::MainWindow(QWidget *parent)
     , m_invertYAxis(false)
     , m_deadzone(0.05)  // 5% deadzone
     , m_updateTimer(new QTimer(this))
+    , m_sineWaveActive(false)
+    , m_sinePhase(0.0)
+    , m_sineFrequency(10.0)
+    , m_sineAmplitude(0.5)
+    , m_phaseOffset(90)
+    , m_loggingActive(false)
+    , m_logFile(nullptr)
+    , m_logStream(nullptr)
 {
     ui->setupUi(this);
 
@@ -234,15 +245,40 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_updateTimer, &QTimer::timeout, this, &MainWindow::onUpdateMirrorPosition);
     m_updateTimer->setInterval(16);  // ~60Hz updates
 
+    // Create mirror status UI
+    createMirrorControlUI();
+
+    // Create sine wave tab
+    createSineWaveTab();
+
     // Initial updates
     updateJoystickList();
     updateMirrorDeviceList();
-    createMirrorControlUI();
 }
 
 MainWindow::~MainWindow()
 {
     m_updateTimer->stop();
+
+    if (m_sineWaveTimer) {
+        m_sineWaveTimer->stop();
+    }
+
+    // Close logging if active
+    if (m_loggingActive) {
+        if (m_logStream) {
+            m_logStream->flush();
+            delete m_logStream;
+            m_logStream = nullptr;
+        }
+
+        if (m_logFile) {
+            m_logFile->close();
+            delete m_logFile;
+            m_logFile = nullptr;
+        }
+    }
+
     m_joystickManager->cleanup();
     m_mirrorController->cleanup();
     delete ui;
@@ -640,15 +676,6 @@ void MainWindow::onEnableMirrorOutput(bool enabled)
             return;
         }
 
-        // Also check the joystick
-        if (!m_joystickManager->isJoystickOpen()) {
-            m_enableMirrorCheckbox->setChecked(false);
-            m_mirrorOutputEnabled = false;
-            QMessageBox::warning(this, "Enable Error",
-                "Cannot enable mirror output: No joystick connected.");
-            return;
-        }
-
         // All checks passed, enable output
         m_mirrorOutputEnabled = true;
         m_updateTimer->start();
@@ -775,4 +802,429 @@ void MainWindow::onInvertAxisToggled(bool checked)
     } else if (sender == m_invertYCheckbox) {
         m_invertYAxis = checked;
     }
+}
+
+// Sine wave test methods
+void MainWindow::createSineWaveTab()
+{
+    // Create tab widget
+    QWidget *sineWaveTab = new QWidget();
+    QVBoxLayout *mainLayout = new QVBoxLayout(sineWaveTab);
+
+    // Create parameter controls group
+    QGroupBox *parametersGroup = new QGroupBox("Sine Wave Parameters");
+    QGridLayout *parametersLayout = new QGridLayout(parametersGroup);
+
+    // Frequency control
+    parametersLayout->addWidget(new QLabel("Frequency (Hz):"), 0, 0);
+    m_frequencySpinBox = new QSpinBox();
+    m_frequencySpinBox->setRange(1, 1000);
+    m_frequencySpinBox->setValue(10);
+    m_frequencySpinBox->setSuffix(" Hz");
+    parametersLayout->addWidget(m_frequencySpinBox, 0, 1);
+    connect(m_frequencySpinBox, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &MainWindow::onFrequencyChanged);
+
+    // Amplitude control
+    parametersLayout->addWidget(new QLabel("Amplitude:"), 1, 0);
+    m_amplitudeSpinBox = new QDoubleSpinBox();
+    m_amplitudeSpinBox->setRange(0.01, 1.0);
+    m_amplitudeSpinBox->setValue(0.5);
+    m_amplitudeSpinBox->setSingleStep(0.01);
+    m_amplitudeSpinBox->setDecimals(2);
+    parametersLayout->addWidget(m_amplitudeSpinBox, 1, 1);
+    connect(m_amplitudeSpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, &MainWindow::onAmplitudeChanged);
+
+    // Phase offset control (degrees between X and Y axes)
+    parametersLayout->addWidget(new QLabel("Phase Offset (°):"), 2, 0);
+    m_phaseOffsetSpinBox = new QSpinBox();
+    m_phaseOffsetSpinBox->setRange(0, 359);
+    m_phaseOffsetSpinBox->setValue(90);
+    m_phaseOffsetSpinBox->setSuffix("°");
+    parametersLayout->addWidget(m_phaseOffsetSpinBox, 2, 1);
+    connect(m_phaseOffsetSpinBox, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &MainWindow::onPhaseOffsetChanged);
+
+    // Axis selection controls
+    parametersLayout->addWidget(new QLabel("Output Axes:"), 3, 0);
+    QHBoxLayout *axisLayout = new QHBoxLayout();
+    m_xAxisCheckBox = new QCheckBox("X-Axis");
+    m_xAxisCheckBox->setChecked(true);
+    axisLayout->addWidget(m_xAxisCheckBox);
+    connect(m_xAxisCheckBox, &QCheckBox::toggled, this, &MainWindow::onXAxisToggled);
+
+    m_yAxisCheckBox = new QCheckBox("Y-Axis");
+    m_yAxisCheckBox->setChecked(true);
+    axisLayout->addWidget(m_yAxisCheckBox);
+    connect(m_yAxisCheckBox, &QCheckBox::toggled, this, &MainWindow::onYAxisToggled);
+
+    parametersLayout->addLayout(axisLayout, 3, 1);
+
+    // Add parameters group to main layout
+    mainLayout->addWidget(parametersGroup);
+
+    // Create output control group
+    QGroupBox *outputGroup = new QGroupBox("Sine Wave Output");
+    QVBoxLayout *outputLayout = new QVBoxLayout(outputGroup);
+
+    // Start/Stop sine wave button
+    m_sineWaveButton = new QPushButton("Start Sine Wave");
+    m_sineWaveButton->setIcon(QIcon(":/sinewaveOff.svg"));
+    m_sineWaveButton->setIconSize(QSize(32, 32));
+    m_sineWaveButton->setCheckable(true);
+    outputLayout->addWidget(m_sineWaveButton);
+    connect(m_sineWaveButton, &QPushButton::clicked, this, &MainWindow::onStartStopSineWave);
+
+    // X-axis output display
+    QHBoxLayout *xOutputLayout = new QHBoxLayout();
+    xOutputLayout->addWidget(new QLabel("X-Output:"));
+    m_xOutputBar = new QProgressBar();
+    m_xOutputBar->setRange(-100, 100);
+    m_xOutputBar->setValue(0);
+    m_xOutputBar->setTextVisible(true);
+    m_xOutputBar->setFormat("%v");
+    xOutputLayout->addWidget(m_xOutputBar);
+    outputLayout->addLayout(xOutputLayout);
+
+    // Y-axis output display
+    QHBoxLayout *yOutputLayout = new QHBoxLayout();
+    yOutputLayout->addWidget(new QLabel("Y-Output:"));
+    m_yOutputBar = new QProgressBar();
+    m_yOutputBar->setRange(-100, 100);
+    m_yOutputBar->setValue(0);
+    m_yOutputBar->setTextVisible(true);
+    m_yOutputBar->setFormat("%v");
+    yOutputLayout->addWidget(m_yOutputBar);
+    outputLayout->addLayout(yOutputLayout);
+
+    // Waveform visualization - allow resize but set minimum
+    m_waveformLabel = new QLabel("Sine Wave Visualization");
+    m_waveformLabel->setAlignment(Qt::AlignCenter);
+    m_waveformLabel->setMinimumSize(400, 150); // Set minimum size instead of fixed
+    m_waveformLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding); // Allow expansion
+    m_waveformLabel->setStyleSheet("border: 1px solid gray; background-color: black;");
+    outputLayout->addWidget(m_waveformLabel);
+
+    // Add output group to main layout
+    mainLayout->addWidget(outputGroup);
+
+    // Create data logging group
+    QGroupBox *loggingGroup = new QGroupBox("Data Logging");
+    QVBoxLayout *loggingLayout = new QVBoxLayout(loggingGroup);
+
+    // Log file selection
+    QHBoxLayout *fileLayout = new QHBoxLayout();
+    fileLayout->addWidget(new QLabel("Log File:"));
+    m_logFileEdit = new QLineEdit();
+    m_logFileEdit->setReadOnly(true);
+    fileLayout->addWidget(m_logFileEdit);
+
+    m_browseButton = new QPushButton("Browse...");
+    fileLayout->addWidget(m_browseButton);
+    connect(m_browseButton, &QPushButton::clicked, this, &MainWindow::onBrowseLogFile);
+
+    loggingLayout->addLayout(fileLayout);
+
+    // Start/Stop logging button
+    m_loggingButton = new QPushButton("Start Logging");
+    m_loggingButton->setEnabled(false); // Disabled until file is selected
+    loggingLayout->addWidget(m_loggingButton);
+    connect(m_loggingButton, &QPushButton::clicked, this, &MainWindow::onStartStopLogging);
+
+    // Add logging group to main layout
+    mainLayout->addWidget(loggingGroup);
+
+    // Add a stretch to keep UI elements at the top
+    mainLayout->addStretch();
+
+    // Add the tab to the tab widget
+    QTabWidget *tabWidget = qobject_cast<QTabWidget*>(centralWidget());
+    if (tabWidget) {
+        tabWidget->addTab(sineWaveTab, "Sine Wave Test");
+    }
+
+    // Initialize sine wave variables
+    m_sineWaveActive = false;
+    m_sinePhase = 0.0;
+    m_sineFrequency = m_frequencySpinBox->value();
+    m_sineAmplitude = m_amplitudeSpinBox->value();
+    m_phaseOffset = m_phaseOffsetSpinBox->value();
+    m_loggingActive = false;
+    m_logFile = nullptr;
+    m_logStream = nullptr;
+
+    // Create sine wave timer
+    m_sineWaveTimer = new QTimer(this);
+    m_sineWaveTimer->setInterval(10); // 10ms = 100Hz update rate
+    connect(m_sineWaveTimer, &QTimer::timeout, this, &MainWindow::onUpdateSineWave);
+
+    // Initialize waveform data vectors
+    m_xWaveformData.resize(100, 0.0);
+    m_yWaveformData.resize(100, 0.0);
+    m_waveformPoints.resize(100);
+}
+
+void MainWindow::onStartStopSineWave()
+{
+    m_sineWaveActive = !m_sineWaveActive;
+
+    if (m_sineWaveActive) {
+        // Starting the sine wave
+        m_sinePhase = 0.0;
+        m_startTime = QDateTime::currentDateTime();
+
+        // Set button to active state
+        m_sineWaveButton->setText("Stop Sine Wave");
+        m_sineWaveButton->setIcon(QIcon(":/sinewave.svg"));
+
+        // Start the timer
+        m_sineWaveTimer->start();
+
+        qDebug() << "Sine wave started. Frequency:" << m_sineFrequency
+                 << "Hz, Amplitude:" << m_sineAmplitude;
+    } else {
+        // Stopping the sine wave
+        m_sineWaveTimer->stop();
+
+        // Reset the mirror position to center
+        if (m_mirrorController->isDeviceOpen()) {
+            m_mirrorController->setPosition(0.0, 0.0);
+        }
+
+        // Set button to inactive state
+        m_sineWaveButton->setText("Start Sine Wave");
+        m_sineWaveButton->setIcon(QIcon(":/sinewaveOff.svg"));
+
+        // Reset progress bars
+        m_xOutputBar->setValue(0);
+        m_yOutputBar->setValue(0);
+
+        qDebug() << "Sine wave stopped";
+    }
+}
+
+void MainWindow::onUpdateSineWave()
+{
+    if (!m_sineWaveActive || !m_mirrorController->isDeviceOpen()) {
+        return;
+    }
+
+    // Calculate elapsed time in seconds since start
+    qint64 elapsedMs = m_startTime.msecsTo(QDateTime::currentDateTime());
+    double elapsedSec = elapsedMs / 1000.0;
+
+    // Calculate the sine wave values (-1.0 to 1.0)
+    double xValue = 0.0;
+    double yValue = 0.0;
+
+    if (m_xAxisCheckBox->isChecked()) {
+        xValue = m_sineAmplitude * sin(2.0 * M_PI * m_sineFrequency * elapsedSec);
+        m_xOutputBar->setValue(static_cast<int>(xValue * 100));
+    }
+
+    if (m_yAxisCheckBox->isChecked()) {
+        // Apply phase offset for Y axis
+        double phaseOffsetRad = m_phaseOffset * M_PI / 180.0;
+        yValue = m_sineAmplitude * sin(2.0 * M_PI * m_sineFrequency * elapsedSec + phaseOffsetRad);
+        m_yOutputBar->setValue(static_cast<int>(yValue * 100));
+    }
+
+    // Output to the mirror
+    m_mirrorController->setPosition(xValue, yValue);
+
+    // Update waveform visualization data
+    m_xWaveformData.pop_front();
+    m_xWaveformData.push_back(xValue);
+    m_yWaveformData.pop_front();
+    m_yWaveformData.push_back(yValue);
+
+    // Update waveform display
+    updateWaveformDisplay();
+
+    // Log data if logging is active
+    if (m_loggingActive && m_logStream) {
+        // Get current mirror position feedback
+        QPair<double, double> currentVoltages = m_mirrorController->getCurrentVoltages();
+
+        // Format: Timestamp, Frequency, Amplitude, X-Commanded, Y-Commanded, X-Feedback, Y-Feedback
+        *m_logStream << elapsedSec << ","
+                    << m_sineFrequency << ","
+                    << m_sineAmplitude << ","
+                    << xValue << ","
+                    << yValue << ","
+                    << currentVoltages.first << ","
+                    << currentVoltages.second << "\n";
+
+        // Ensure data is written to disk
+        m_logStream->flush();
+    }
+}
+
+void MainWindow::updateWaveformDisplay()
+{
+    // Use the current width and height of the label
+    int width = m_waveformLabel->width();
+    int height = m_waveformLabel->height();
+
+    // Create pixmap of current size
+    QPixmap pixmap(width, height);
+    pixmap.fill(Qt::black);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    int centerY = height / 2;
+
+    // Draw zero line
+    painter.setPen(QPen(Qt::darkGray, 1));
+    painter.drawLine(0, centerY, width, centerY);
+
+    // Calculate point spacing based on current width
+    double pointSpacing = static_cast<double>(width) / (m_xWaveformData.size() - 1);
+
+    // Draw X waveform
+    if (m_xAxisCheckBox->isChecked()) {
+        painter.setPen(QPen(Qt::green, 2));
+        QPolygonF points;
+
+        for (int i = 0; i < m_xWaveformData.size(); ++i) {
+            // Calculate x-coordinate based on fixed spacing (data rolls left)
+            double x = width - (m_xWaveformData.size() - 1 - i) * pointSpacing;
+
+            // Calculate y-coordinate (centered around middle of display)
+            double y = centerY - m_xWaveformData[i] * centerY * 0.9; // 90% of half height
+
+            points << QPointF(x, y);
+        }
+        painter.drawPolyline(points);
+    }
+
+    // Draw Y waveform
+    if (m_yAxisCheckBox->isChecked()) {
+        painter.setPen(QPen(Qt::red, 2));
+        QPolygonF points;
+
+        for (int i = 0; i < m_yWaveformData.size(); ++i) {
+            // Calculate x-coordinate based on fixed spacing (data rolls left)
+            double x = width - (m_yWaveformData.size() - 1 - i) * pointSpacing;
+
+            // Calculate y-coordinate (centered around middle of display)
+            double y = centerY - m_yWaveformData[i] * centerY * 0.9; // 90% of half height
+
+            points << QPointF(x, y);
+        }
+        painter.drawPolyline(points);
+    }
+
+    // Set the pixmap to the label
+    m_waveformLabel->setPixmap(pixmap);
+}
+
+void MainWindow::onBrowseLogFile()
+{
+    QString filePath = QFileDialog::getSaveFileName(this,
+                                                   "Select Log File",
+                                                   "",
+                                                   "CSV Files (*.csv)");
+
+    if (!filePath.isEmpty()) {
+        m_logFileEdit->setText(filePath);
+        m_loggingButton->setEnabled(true);
+    }
+}
+
+void MainWindow::onStartStopLogging()
+{
+    m_loggingActive = !m_loggingActive;
+
+    if (m_loggingActive) {
+        // Start logging
+        QString filePath = m_logFileEdit->text();
+        if (filePath.isEmpty()) {
+            QMessageBox::warning(this, "Logging Error", "Please select a log file first.");
+            m_loggingActive = false;
+            return;
+        }
+
+        // Create and open the log file
+        m_logFile = new QFile(filePath);
+        if (!m_logFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::warning(this, "Logging Error",
+                                "Failed to open log file: " + m_logFile->errorString());
+            delete m_logFile;
+            m_logFile = nullptr;
+            m_loggingActive = false;
+            return;
+        }
+
+        // Create the text stream
+        m_logStream = new QTextStream(m_logFile);
+
+        // Write header
+        *m_logStream << "Time(s),Frequency(Hz),Amplitude,X-Command,Y-Command,X-Feedback(V),Y-Feedback(V)\n";
+
+        // Update UI
+        m_loggingButton->setText("Stop Logging");
+        m_browseButton->setEnabled(false);
+
+        qDebug() << "Data logging started to file:" << filePath;
+    } else {
+        // Stop logging
+        if (m_logStream) {
+            m_logStream->flush();
+            delete m_logStream;
+            m_logStream = nullptr;
+        }
+
+        if (m_logFile) {
+            m_logFile->close();
+            delete m_logFile;
+            m_logFile = nullptr;
+        }
+
+        // Update UI
+        m_loggingButton->setText("Start Logging");
+        m_browseButton->setEnabled(true);
+
+        qDebug() << "Data logging stopped";
+    }
+}
+
+void MainWindow::onFrequencyChanged(int value)
+{
+    m_sineFrequency = value;
+    qDebug() << "Sine wave frequency changed to" << value << "Hz";
+}
+
+void MainWindow::onAmplitudeChanged(double value)
+{
+    m_sineAmplitude = value;
+    qDebug() << "Sine wave amplitude changed to" << value;
+}
+
+void MainWindow::onXAxisToggled(bool checked)
+{
+    qDebug() << "X-axis output" << (checked ? "enabled" : "disabled");
+
+    // If both X and Y are unchecked, reset the mirror to center
+    if (!checked && !m_yAxisCheckBox->isChecked() && m_sineWaveActive) {
+        m_mirrorController->setPosition(0.0, 0.0);
+    }
+}
+
+void MainWindow::onYAxisToggled(bool checked)
+{
+    qDebug() << "Y-axis output" << (checked ? "enabled" : "disabled");
+
+    // If both X and Y are unchecked, reset the mirror to center
+    if (!checked && !m_xAxisCheckBox->isChecked() && m_sineWaveActive) {
+        m_mirrorController->setPosition(0.0, 0.0);
+    }
+}
+
+void MainWindow::onPhaseOffsetChanged(int value)
+{
+    m_phaseOffset = value;
+    qDebug() << "Phase offset changed to" << value << "degrees";
 }
