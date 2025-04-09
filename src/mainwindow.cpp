@@ -18,6 +18,7 @@
 #include <QDoubleSpinBox>
 #include <QPainter>
 #include <QDateTime>
+#include <QElapsedTimer>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -40,10 +41,12 @@ MainWindow::MainWindow(QWidget *parent)
     , m_loggingActive(false)
     , m_logFile(nullptr)
     , m_logStream(nullptr)
+    , m_loggingThread(new LoggingThread(this))
     // Initialize tracker-related members
     , m_trackerMemory(new TrackerMemory(this))
     , m_trackerLogger(new Logger(this))
     , m_trackerPollTimer(new QTimer(this))
+    , m_loggingTimer()
 {
     ui->setupUi(this);
 
@@ -838,12 +841,14 @@ void MainWindow::createSineWaveTab()
 
     // Frequency control
     parametersLayout->addWidget(new QLabel("Frequency (Hz):"), 0, 0);
-    m_frequencySpinBox = new QSpinBox();
-    m_frequencySpinBox->setRange(1, 1000);
-    m_frequencySpinBox->setValue(10);
+    m_frequencySpinBox = new QDoubleSpinBox();
+    m_frequencySpinBox->setRange(0.1, 1000.0);
+    m_frequencySpinBox->setValue(10.0);
+    m_frequencySpinBox->setSingleStep(0.1);
+    m_frequencySpinBox->setDecimals(1);
     m_frequencySpinBox->setSuffix(" Hz");
     parametersLayout->addWidget(m_frequencySpinBox, 0, 1);
-    connect(m_frequencySpinBox, QOverload<int>::of(&QSpinBox::valueChanged),
+    connect(m_frequencySpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &MainWindow::onFrequencyChanged);
 
     // Amplitude control
@@ -975,15 +980,18 @@ void MainWindow::createSineWaveTab()
     m_logFile = nullptr;
     m_logStream = nullptr;
 
-    // Create sine wave timer
+    // Create sine wave timer with 1ms interval for 1000Hz
     m_sineWaveTimer = new QTimer(this);
-    m_sineWaveTimer->setInterval(10); // 10ms = 100Hz update rate
+    m_sineWaveTimer->setInterval(1); // 1ms = 1000Hz update rate
     connect(m_sineWaveTimer, &QTimer::timeout, this, &MainWindow::onUpdateSineWave);
 
-    // Initialize waveform data vectors
+    // Initialize waveform data vectors with appropriate size
     m_xWaveformData.resize(100, 0.0);
     m_yWaveformData.resize(100, 0.0);
     m_waveformPoints.resize(100);
+
+    // Initialize data logging buffer
+    m_logBuffer.reserve(1000); // Pre-allocate space for 1 second of data
 }
 
 void MainWindow::onStartStopSineWave()
@@ -1032,8 +1040,8 @@ void MainWindow::onUpdateSineWave()
     }
 
     // Calculate elapsed time in seconds since start
-    qint64 elapsedMs = m_startTime.msecsTo(QDateTime::currentDateTime());
-    double elapsedSec = elapsedMs / 1000.0;
+    qint64 elapsedNs = m_loggingTimer.nsecsElapsed();
+    double elapsedSec = elapsedNs / 1.0e9;  // Convert nanoseconds to seconds
 
     // Calculate the sine wave values (-1.0 to 1.0)
     double xValue = 0.0;
@@ -1045,7 +1053,6 @@ void MainWindow::onUpdateSineWave()
     }
 
     if (m_yAxisCheckBox->isChecked()) {
-        // Apply phase offset for Y axis
         double phaseOffsetRad = m_phaseOffset * M_PI / 180.0;
         yValue = m_sineAmplitude * sin(2.0 * M_PI * m_sineFrequency * elapsedSec + phaseOffsetRad);
         m_yOutputBar->setValue(static_cast<int>(yValue * 100));
@@ -1054,35 +1061,65 @@ void MainWindow::onUpdateSineWave()
     // Output to the mirror
     m_mirrorController->setPosition(xValue, yValue);
 
-    // Update waveform visualization data
-    m_xWaveformData.pop_front();
-    m_xWaveformData.push_back(xValue);
-    m_yWaveformData.pop_front();
-    m_yWaveformData.push_back(yValue);
-
-    // Update waveform display
-    updateWaveformDisplay();
-
     // Log data if logging is active
-    if (m_loggingActive && m_logStream) {
+    if (m_loggingActive) {
         // Get current mirror position feedback
         QPair<double, double> currentVoltages = m_mirrorController->getCurrentVoltages();
 
-        // Get high-precision timestamp
-        QString timestamp = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz");
+        // Create a data record
+        LogRecord record;
+        record.elapsedTime = elapsedNs;
+        record.frequency = m_sineFrequency;
+        record.amplitude = m_sineAmplitude;
+        record.xCommand = xValue;
+        record.yCommand = yValue;
+        record.xFeedback = currentVoltages.first;
+        record.yFeedback = currentVoltages.second;
 
-        // Format values with 5 decimal places
-        *m_logStream << timestamp << ","
-                    << QString::number(m_sineFrequency, 'f', 5) << ","
-                    << QString::number(m_sineAmplitude, 'f', 5) << ","
-                    << QString::number(xValue, 'f', 5) << ","
-                    << QString::number(yValue, 'f', 5) << ","
-                    << QString::number(currentVoltages.first, 'f', 5) << ","
-                    << QString::number(currentVoltages.second, 'f', 5) << "\n";
-
-        // Ensure data is written to disk
-        m_logStream->flush();
+        // Add record to logging thread
+        m_loggingThread->addRecord(record);
     }
+
+    // Update visualization less frequently (every 10ms)
+    static int visualUpdateCounter = 0;
+    if (++visualUpdateCounter >= 10) {
+        visualUpdateCounter = 0;
+
+        // Update waveform visualization data
+        m_xWaveformData.pop_front();
+        m_xWaveformData.push_back(xValue);
+        m_yWaveformData.pop_front();
+        m_yWaveformData.push_back(yValue);
+
+        // Update waveform display
+        updateWaveformDisplay();
+    }
+}
+
+void MainWindow::writeLogBuffer()
+{
+    if (!m_logStream || m_logBuffer.isEmpty()) {
+        return;
+    }
+
+    // Write all records in the buffer
+    for (const LogRecord& record : m_logBuffer) {
+        // Convert nanoseconds to seconds with 9 decimal places (nanosecond precision)
+        double elapsedSeconds = record.elapsedTime / 1.0e9;
+        *m_logStream << QString::number(elapsedSeconds, 'f', 9) << ","
+                    << QString::number(record.frequency, 'f', 1) << ","
+                    << QString::number(record.amplitude, 'f', 1) << ","
+                    << QString::number(record.xCommand, 'f', 5) << ","
+                    << QString::number(record.yCommand, 'f', 5) << ","
+                    << QString::number(record.xFeedback, 'f', 5) << ","
+                    << QString::number(record.yFeedback, 'f', 5) << "\n";
+    }
+
+    // Flush the data to disk
+    m_logStream->flush();
+
+    // Clear the buffer
+    m_logBuffer.clear();
 }
 
 void MainWindow::updateWaveformDisplay()
@@ -1171,26 +1208,11 @@ void MainWindow::onStartStopLogging()
             return;
         }
 
-        // Create and open the log file
-        m_logFile = new QFile(filePath);
-        if (!m_logFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::warning(this, "Logging Error",
-                                "Failed to open log file: " + m_logFile->errorString());
-            delete m_logFile;
-            m_logFile = nullptr;
-            m_loggingActive = false;
-            return;
-        }
+        // Start the timer for elapsed time tracking
+        m_loggingTimer.start();
 
-        // Create the text stream
-        m_logStream = new QTextStream(m_logFile);
-
-        // Set high precision for floating point values
-        m_logStream->setRealNumberPrecision(5); // 5 decimal places
-        m_logStream->setRealNumberNotation(QTextStream::FixedNotation);
-
-        // Write header
-        *m_logStream << "Timestamp,Frequency(Hz),Amplitude,X-Command,Y-Command,X-Feedback(V),Y-Feedback(V)" << Qt::endl;
+        // Start the logging thread
+        m_loggingThread->startLogging(filePath);
 
         // Update UI
         m_loggingButton->setText("Stop Logging");
@@ -1199,17 +1221,7 @@ void MainWindow::onStartStopLogging()
         qDebug() << "Data logging started to file:" << filePath;
     } else {
         // Stop logging
-        if (m_logStream) {
-            m_logStream->flush();
-            delete m_logStream;
-            m_logStream = nullptr;
-        }
-
-        if (m_logFile) {
-            m_logFile->close();
-            delete m_logFile;
-            m_logFile = nullptr;
-        }
+        m_loggingThread->stopLogging();
 
         // Update UI
         m_loggingButton->setText("Start Logging");
@@ -1219,7 +1231,7 @@ void MainWindow::onStartStopLogging()
     }
 }
 
-void MainWindow::onFrequencyChanged(int value)
+void MainWindow::onFrequencyChanged(double value)
 {
     m_sineFrequency = value;
     qDebug() << "Sine wave frequency changed to" << value << "Hz";

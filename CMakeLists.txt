@@ -29,6 +29,9 @@ set(PROJECT_SOURCES
     src/trackdata.h
     src/logger.cpp
     src/logger.h
+    src/loggingthread.cpp
+    src/loggingthread.h
+    src/logrecord.h
     resources/resources.qrc
 )
 

@@ -26,6 +26,8 @@
 #include "trackermemory.h"
 #include "trackdata.h"
 #include "logger.h"
+#include <QElapsedTimer>
+#include "loggingthread.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -70,7 +72,7 @@ private slots:
     void onUpdateSineWave();
     void onBrowseLogFile();
     void onStartStopLogging();
-    void onFrequencyChanged(int value);
+    void onFrequencyChanged(double value);
     void onAmplitudeChanged(double value);
     void onXAxisToggled(bool checked);
     void onYAxisToggled(bool checked);
@@ -116,18 +118,18 @@ private:
     QProgressBar *m_mirrorYBar;
 
     // Sine wave test UI elements
-    QSpinBox *m_frequencySpinBox;
+    QPushButton *m_sineWaveButton;
+    QProgressBar *m_xOutputBar;
+    QProgressBar *m_yOutputBar;
+    QLabel *m_waveformLabel;
+    QDoubleSpinBox *m_frequencySpinBox;
     QDoubleSpinBox *m_amplitudeSpinBox;
     QSpinBox *m_phaseOffsetSpinBox;
-    QPushButton *m_sineWaveButton;
-    QCheckBox *m_xAxisCheckBox;
-    QCheckBox *m_yAxisCheckBox;
     QPushButton *m_loggingButton;
     QLineEdit *m_logFileEdit;
     QPushButton *m_browseButton;
-    QLabel *m_waveformLabel;
-    QProgressBar *m_xOutputBar;
-    QProgressBar *m_yOutputBar;
+    QCheckBox *m_xAxisCheckBox;
+    QCheckBox *m_yAxisCheckBox;
 
     // Sine wave generation
     QTimer *m_sineWaveTimer;
@@ -177,6 +179,13 @@ private:
     QPushButton *m_trackerStopLoggingButton;
     QCheckBox *m_trackerAutoPollCheckBox;
 
+    // Add data logging buffer
+    QVector<LogRecord> m_logBuffer;
+
+    QElapsedTimer m_loggingTimer;
+
+    LoggingThread* m_loggingThread;
+
     void createJoystickInputsUI();
     void clearJoystickInputsUI();
     void createMirrorControlUI();
@@ -186,6 +195,7 @@ private:
     void updateTrackerUI(const TrackData& data);
     void setTrackerUIEnabled(bool enabled);
     QString hatValueToString(int value);
+    void writeLogBuffer();
 
     // Helper method to map joystick axis value to mirror position
     double mapAxisToPosition(int axisValue);
